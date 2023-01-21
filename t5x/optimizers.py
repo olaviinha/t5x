@@ -21,10 +21,12 @@ Additional support for the legacy Adafactor implementation.
 """
 
 import functools
-from typing import Any, Optional, Union, Sequence, Tuple
+from typing import Any, Optional, Union, Sequence, Tuple, Mapping
 
 import flax
-from flax import optim  # just used for transitional type definitions
+
+# just used for transitional type definitions
+
 from flax import serialization
 from flax import struct
 from flax import traverse_util
@@ -33,6 +35,8 @@ from flax.serialization import from_state_dict
 from flax.serialization import to_state_dict
 import jax
 import jax.numpy as jnp
+from jestimator import amos
+from jestimator import amos_helper
 import optax
 
 freeze = flax.core.frozen_dict.freeze
@@ -83,7 +87,7 @@ class OptimizerDef:
       target: the object to be optimized. This is typically a variable dict
         returned by `flax.linen.Module.init()`, but it can also be a container
         of variables dicts, e.g. `(v1, v2)` and  `('var1': v1, 'var2': v2)` are
-          valid inputs as well.
+        valid inputs as well.
 
     Returns:
       An instance of `Optimizer`.
@@ -162,9 +166,10 @@ class Optimizer(struct.PyTreeNode):
 
 # Transitional Type Definitions
 
-OptimizerType = Union[optim.Optimizer, Optimizer]
-OptimizerStateType = Union[optim.OptimizerState, OptimizerState]
-OptimizerDefType = Union[optim.OptimizerDef, OptimizerDef]
+OptimizerType = Optimizer
+OptimizerStateType = Union[OptimizerState, Mapping[str, Any]]
+OptimizerDefType = OptimizerDef
+
 
 # Optax Elementwise Wrapper
 
@@ -188,6 +193,8 @@ class OptaxStatePartitionRules:
   _RULES = {
 
       # Leaf Optax States:
+      amos.ScaleByAmosState:
+          amos_helper.state_partition_rule,
       optax.AddNoiseState:
           lambda state, params_axes: optax.AddNoiseState(
               count=None, rng_key=None),
@@ -222,8 +229,6 @@ class OptaxStatePartitionRules:
           lambda state, params_axes: optax.ScaleByTrustRatioState(),
       optax.ScaleByScheduleState:
           lambda state, params_axes: optax.ScaleByScheduleState(count=None),
-      optax.ScaleByFromageState:
-          lambda state, params_axes: optax.ScaleByFromageState(count=None),
       optax.ZeroNansState:
           lambda state, params_axes: optax.ZeroNansState(found_nan=None),
       # FactoredState
@@ -295,7 +300,7 @@ class OptaxStatePartitionRules:
   def derive_optax_logical_axes(cls, optax_state, params_axes):
     """Derived logical axes for optax state."""
     # Flatten the optax state but do not go into the registered states.
-    flattened_state, tree_def = jax.tree_flatten(
+    flattened_state, tree_def = jax.tree_util.tree_flatten(
         optax_state, is_leaf=cls._is_optax_state)
 
     def derive_fn(x):
@@ -307,7 +312,7 @@ class OptaxStatePartitionRules:
       return cls._RULES[type(x)](x, params_axes)
 
     flattened_axes = [derive_fn(x) for x in flattened_state]
-    derived_axes = jax.tree_unflatten(tree_def, flattened_axes)
+    derived_axes = jax.tree_util.tree_unflatten(tree_def, flattened_axes)
     return derived_axes
 
 
@@ -387,6 +392,75 @@ class OptaxWrapper(OptimizerDef):
 
     return optimizer.restore_state(frozen_dict.unfreeze(optimizer_logical_axes))
 
+  def state_dict(self, target, state):
+    """Override state dict function.
+
+    We need to override this function because many optax transformations use
+    `optax.EmptyState`, which produces empty dict in the state dict. This causes
+    the T5 training loop to fail in multiple places. As a remedy, we will
+    filter out the generated state dict so that there are no empty dict in the
+    output.
+
+    The restore_state function is also overridden to reconstruct those empty
+    dict.
+
+    Args:
+      target: Pytree of target variables.
+      state: Pytree of optimizer state.
+
+    Returns:
+      A nested state.
+    """
+    state_dict = to_state_dict(state)
+
+    # This step removes any empty dict (recursively) in the state dict.
+    state_dict = traverse_util.unflatten_dict(
+        traverse_util.flatten_dict(state_dict, sep='/'), sep='/')
+
+    return to_state_dict({
+        'target': to_state_dict(target),
+        'state': state_dict,
+    })
+
+  def restore_state(self, opt_target, opt_state, state_dict):
+    """Override to restore empty dicts corresponding to `optax.EmptyState`.
+
+    Args:
+      opt_target: the optimizer target.
+      opt_state: the optimizer state.
+      state_dict: the state dict containing the desired new state of the
+        optimizer.
+
+    Returns:
+      a tuple of the optimizer target and state with the restored values from
+      the state dict.
+    """
+    opt_target = from_state_dict(opt_target, state_dict['target'])
+
+    # Get all the possible keys in the reference optimizer state.
+    flat_ref_opt_state_dict = traverse_util.flatten_dict(
+        to_state_dict(opt_state), keep_empty_nodes=True, sep='/')
+
+    flat_src_opt_state_dict = dict(
+        traverse_util.flatten_dict(state_dict['state'], sep='/'))
+    # Adding the empty paths back to flat_src_opt_state_dict.
+    for k, v in flat_ref_opt_state_dict.items():
+      if k in flat_src_opt_state_dict:
+        continue
+      # The key is not in the input state dict, presumably because it
+      # corresponds to an empty dict.
+      if v != traverse_util.empty_node:
+        raise ValueError(
+            f'Failed to restore optimizer state, path {k} is not present '
+            'in the input optimizer state dict.')
+      flat_src_opt_state_dict[k] = v
+
+    # Restore state from the enhanced state dict.
+    opt_state = from_state_dict(
+        opt_state,
+        traverse_util.unflatten_dict(flat_src_opt_state_dict, sep='/'))
+    return opt_target, opt_state
+
 
 # Optax wrapper and elementary wrapped optax optimizers.
 
@@ -411,10 +485,18 @@ def wrap_optax_optimizer(optax_optimizer):
   return wrapped_optimizer
 
 
+def chain(
+    transformations: Sequence[optax.GradientTransformation]
+) -> optax.GradientTransformation:
+  return optax.chain(*transformations)
+
+
+chain = wrap_optax_optimizer(chain)
 adabelief = wrap_optax_optimizer(optax.adabelief)
 adagrad = wrap_optax_optimizer(optax.adagrad)
 adam = wrap_optax_optimizer(optax.adam)
 adamw = wrap_optax_optimizer(optax.adamw)
+amos = wrap_optax_optimizer(amos.amos)
 fromage = wrap_optax_optimizer(optax.fromage)
 lars = wrap_optax_optimizer(optax.lars)
 lamb = wrap_optax_optimizer(optax.lamb)
@@ -625,3 +707,6 @@ class MultiOptimizer(OptimizerDef):
         lambda x: (None if isinstance(x, _Marker) else x), param_states)
     return Optimizer(optimizer.optimizer_def,
                      OptimizerState(None, param_states), param_logical_axes)
+
+  # TODO(levskaya): add traversal handling for state_dict / restore_state
+  # this is required to make this work w. optax optimizers...

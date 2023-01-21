@@ -8,7 +8,7 @@ defined with [SeqIO](https://github.com/google/seqio/blob/main/README.md).
 
 Refer to this tutorial when you have an existing model that you want to
 evaluate. If you would like to fine-tune your model before evaluation, please
-refer to the [fine-tuning](finetune) tutorial. You can run evals as part of your
+refer to the [fine-tuning](finetune.md) tutorial. You can run evals as part of your
 fine-tuning run as well.
 
 ## Overview
@@ -38,10 +38,10 @@ SeqIO Task will be used:
 +   Model checkpoint -
     [`cbqa/small_ssm_nq/model.ckpt-1110000`](https://console.cloud.google.com/storage/browser/t5-data/pretrained_models/cbqa/small_ssm_nq/)
 +   Model Gin file -
-    [`t5x/configs/models/t5_1_1_small.gin`](https://github.com/google-research/t5x/tree/main/t5x/google/examples/flaxformer_t5/configs/models/t5_1_1_small.gin).
+    [`t5x/configs/models/t5_1_1_small.gin`](https://github.com/google-research/t5x/blob/main/t5x/google/examples/flaxformer_t5/configs/models/t5_1_1_small.gin).
 
 If you would like to fine-tune your model before evaluation, please follow the
-[fine-tuning](finetune) tutorial, and continue to Step 2.
+[fine-tuning](finetune.md) tutorial, and continue to Step 2.
 
 ## Step 2: Choose a SeqIO Task/Mixture
 
@@ -58,8 +58,7 @@ Many common datasets and benchmarks, e.g. [GLUE](https://gluebenchmark.com/),
 [CNN/Daily Mail](https://github.com/abisee/cnn-dailymail), etc. have been
 implemented as SeqIO Tasks/Mixtures and can be used directly. These
 Tasks/Mixtures are defined in
-[`t5/data/tasks.py`](https://github.com/google-research/text-to-text-transfer-transformer/tree/main/t5/data/tasks.py)
-and
+[`t5/data/tasks.py`](https://github.com/google-research/text-to-text-transfer-transformer/tree/main/t5/data/tasks.py) and
 [`t5/data/mixtures.py`](https://github.com/google-research/text-to-text-transfer-transformer/tree/main/t5/data/mixtures.py).
 
 For the example run, you will evaluate the model on the Natural Questions
@@ -84,7 +83,7 @@ to configure your run using Gin. If you're not familiar with Gin, reading the
 [T5X Gin Primer](gin.md) is recommended.
 
 T5X provides a Gin file that configures the T5X eval job (located at
-[`t5x/configs/runs/eval.gin`](https://github.com/google-research/t5x/tree/main/t5x/configs/runs/eval.gin)),
+[`t5x/configs/runs/eval.gin`](https://github.com/google-research/t5x/blob/main/t5x/configs/runs/eval.gin)),
 and expects a few params from you. These params can be specified in a separate
 Gin file, or via commandline flags. Following are the required params:
 
@@ -101,9 +100,9 @@ Gin file, or via commandline flags. Following are the required params:
     the next step.
 
 In addition to the above params, you will need to import
-[`eval.gin`](https://github.com/google-research/t5x/tree/main/t5x/configs/runs/eval.gin) and the
+[`eval.gin`](https://github.com/google-research/t5x/blob/main/t5x/configs/runs/eval.gin) and the
 Gin file for the model, which for the example run is
-[`t5_1_1_small.gin`](https://github.com/google-research/t5x/tree/main/t5x/google/examples/flaxformer_t5/configs/models/t5_1_1_small.gin).
+[`t5_1_1_small.gin`](https://github.com/google-research/t5x/blob/main/t5x/google/examples/flaxformer_t5/configs/models/t5_1_1_small.gin).
 
 ```gin
 include 'runs/eval.gin'
@@ -125,9 +124,9 @@ google_research.t5_closed_book_qa.t5_cbqa.tasks`
 since it is where 'glue_v002_proportional' is registered.
 
 If you choose a module that is not included as a dependency in the T5X trainer
-[binary](https://github.com/google-research/t5x/tree/main/t5x/BUILD;l=76;rcl=398627055), or if you
+[binary](https://github.com/google-research/t5x/blob/main/t5x/BUILD;l=76;rcl=398627055), or if you
 have defined your gin config file in a location other than the
-[T5X config directory](https://github.com/google-research/t5x/tree/main/t5x/configs/), you will
+[T5X config directory](https://github.com/google-research/t5x/blob/main/t5x/configs/), you will
 need to follow the instructions in the
 [Advanced Topics section](#custom-t5x-binaries) to link in the custom gin file
 and/or task definition.
@@ -151,7 +150,7 @@ MIXTURE_OR_TASK_NAME = 'natural_questions_open'
 ```
 
 See
-[`t5_1_1_small_cbqa_natural_questions.gin`](https://github.com/google-research/t5x/tree/main/t5x/google/examples/flaxformer_t5/configs/examples/eval/t5_1_1_small_cbqa_natural_questions.gin)
+[`t5_1_1_small_cbqa_natural_questions.gin`](https://github.com/google-research/t5x/blob/main/t5x/google/examples/flaxformer_t5/configs/examples/eval/t5_1_1_small_cbqa_natural_questions.gin)
 for this example.
 
 In this example, we run the evaluation on one checkpoint. It is common to
@@ -179,7 +178,7 @@ paths should contain all Gin files used or included in your experiment.
 
 
 You can have a look inside
-[`eval.gin`](https://github.com/google-research/t5x/tree/main/t5x/configs/runs/eval.gin) to see
+[`eval.gin`](https://github.com/google-research/t5x/blob/main/t5x/configs/runs/eval.gin) to see
 other useful parameters that it is possible to pass in, including dataset split,
 batch size, and random seed.
 
@@ -204,9 +203,9 @@ python -m t5.scripts.parse_tb \
 Now that you have successfully evaluated a model on the Natural Questions
 benchmark, here are some topics you might want to explore next:
 
-+   [Running inference on a model.](infer)
-+   [Fine-tuning a model.](finetune)
-+   [Training a model from scratch.](pretrain)
++   [Running inference on a model.](infer.md)
++   [Fine-tuning a model.](finetune.md)
++   [Training a model from scratch.](pretrain.md)
 
 We also touch upon a few advanced topics related to evaluations below that might
 be useful, especially when customizing your eval job.
@@ -217,3 +216,9 @@ be useful, especially when customizing your eval job.
 ### Defining a custom SeqIO Task/Mixture to evaluate on {.no-toc}
 
 Refer to [SeqIO documentation](https://github.com/google/seqio/blob/main/README.md).
+
+### Defining a custom metric to evaluate
+
+The best way to define a custom metric is to define a new SeqIO Task/Mixture
+that contains this custom metric. Please refer to the SeqIO Documentation on
+[custom metrics](https://github.com/google/seqio/blob/main/README.md#metrics).

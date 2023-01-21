@@ -35,16 +35,18 @@ from typing import Any, Callable, Iterator, List, Mapping, Optional, Sequence, T
 # pylint:disable=g-import-not-at-top
 os.environ['FLAX_LAZY_RNG'] = 'no'
 from absl import logging
+from clu import metric_writers
 import jax
-from jax.experimental import multihost_utils
 import jax.numpy as jnp
 import numpy as np
 import seqio
+from t5x import gin_utils
 from t5x import models
 from t5x import partitioning
 from t5x import utils
 import tensorflow as tf
 from tensorflow.io import gfile
+from typing_extensions import Protocol
 
 # Automatically search for gin files relative to the T5X package.
 _DEFAULT_GIN_SEARCH_PATHS = [
@@ -52,6 +54,14 @@ _DEFAULT_GIN_SEARCH_PATHS = [
 ]
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
+
+
+class SummarizeConfigFn(Protocol):
+
+  def __call__(self, model_dir: str,
+               summary_writer: Optional[metric_writers.SummaryWriter],
+               step: int) -> None:
+    ...
 
 
 class FailFastThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
@@ -62,7 +72,7 @@ class FailFastThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
-    self._incomplete_futures: List[concurrent.futures.Future[Any]] = []
+    self._incomplete_futures: List[concurrent.futures.Future] = []
 
   def check_for_exceptions(self, wait: bool = False):
     """Raises any exceptions from complete futures on the main thread."""
@@ -77,7 +87,7 @@ class FailFastThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
 
     self._incomplete_futures = still_incomplete_futures
 
-  def submit(self, *args, **kwargs) -> concurrent.futures.Future[Any]:
+  def submit(self, *args, **kwargs) -> concurrent.futures.Future:
     """Submit function to threadpool, capturing the returned future."""
     future = super().submit(*args, **kwargs)
     self._incomplete_futures.append(future)
@@ -206,7 +216,7 @@ def write_inferences_to_file(
     path: File path to write to.
     inferences: A tuple containing (predictions, aux_values). If mode is
       'predict' then the `predictions` will be token IDs. If it's
-      'scores' then it'll be a collection of scores. `aux_values` will be an
+      'score' then it'll be a collection of scores. `aux_values` will be an
       empty dictionary unless mode is 'predict_with_aux', in which case it'll
       contain the model's auxiliary outputs.
     task_ds: Original task dataset. Features from task with suffix
@@ -340,9 +350,15 @@ def infer(
     merge_chunked_results: bool = True,
     write_fn: WriteFn = write_inferences_to_file,
     checkpoint_ds_iter: bool = True,
+    train_state_initializer_cls: Type[
+        utils.TrainStateInitializer] = utils.TrainStateInitializer,
     fallback_init_rng: Optional[int] = None,
     merge_fn: MergeFn = merge_chunks_to_file,
-):
+    summarize_config_fn: SummarizeConfigFn = gin_utils.summarize_gin_config,
+    verify_matching_vocabs_fn: Optional[
+        Callable[[utils.DatasetConfig, models.BaseTransformerModel],
+                 None]] = utils.verify_matching_vocabs,
+    output_vocab_feature_name: str = 'targets'):
   """Infer function.
 
   Args:
@@ -368,13 +384,29 @@ def infer(
       `checkpoint_period` to enable faster restore. This must be disabled for
       certain datasets, for example since stateful iterators (e.g. from
       seqio.FunctionTask) cannot be checkpointed.
+    train_state_initializer_cls: t5x.utils.TrainStateInitializer class
+      for initializing partitioned TrainState from checkpoints or scratch.
     fallback_init_rng: A random seed used for parameter initialization during
       model re-loading when utils.RestoreCheckpointConfig.fallback_to_scratch is
       set to True. If None, parameter initialization is not allowed during model
       loading and having fallback_to_scratch enabled will result in an error.
     merge_fn: Callable function used to merge inferences from multiple files.
+    summarize_config_fn: A function that takes in the model directory, an
+      optional SummaryWriter, and the step number, and writes a summary of the
+      configuration. SummaryWriter will be None in most cases.
+    verify_matching_vocabs_fn: Function to validate whether the task vocabulary
+      matches the model vocabulary. Should raise an exception on error.
+    output_vocab_feature_name: The name of the feature corresponding to the
+      output vocabulary.
   """
+  jax.monitoring.record_event('/jax/t5x/infer/beacon')
   logging.info('Process ID: %d', jax.process_index())
+
+  # Only allow `shard_id` 0 to write config summary, since the config summary
+  # does NOT depend on `shard_id`.
+  if shard_id == 0:
+    summarize_config_fn(model_dir=output_dir, summary_writer=None, step=0)
+
   if mode not in ('predict', 'score', 'predict_with_aux'):
     raise ValueError(
         "`mode` must be one of 'predict', 'score' or 'predict_with_aux'. "
@@ -382,13 +414,8 @@ def infer(
 
   # Remove double-slashes in directory path to avoid inconsistencies.
   output_dir = re.sub(r'(?<!gs:)([\/]{2,})', '/', output_dir)
-  ds_vocabs = utils.get_vocabulary(dataset_cfg)
-  if (ds_vocabs[0] != model.input_vocabulary or
-      ds_vocabs[1] != model.output_vocabulary):
-    raise ValueError(
-        'Model and Task vocabularies do not match.\n'
-        f'Task Input: {ds_vocabs[0]}, Model Input: {model.input_vocabulary}\n'
-        f'Task Output: {ds_vocabs[1]}, Model Output: {model.output_vocabulary}')
+  if verify_matching_vocabs_fn is not None:
+    verify_matching_vocabs_fn(dataset_cfg, model)
 
   batch_size = dataset_cfg.batch_size
 
@@ -429,7 +456,7 @@ def infer(
   }
   # Initialize optimizer from the existing checkpoint.
   # TODO(adarob): Support inference over multiple checkpoints.
-  train_state_initializer = utils.TrainStateInitializer(
+  train_state_initializer = train_state_initializer_cls(
       optimizer_def=None,  # Do not load optimizer state.
       init_fn=model.get_initial_variables,
       input_shapes=input_shapes,
@@ -500,7 +527,7 @@ def infer(
         input_ckpt.read(ckpt_path).assert_consumed()
 
     output_fname = f'{task.name}-{mode}.jsonl-{shard_id:05}-of-{num_shards:05}'
-    if gfile.exists(os.path.join(output_dir, output_fname)):
+    if gfile.exists(os.path.join(output_dir, f'{output_fname}.COMPLETED')):
       logging.info(
           "File %s exists. Skipping inference for shard %d/%d of task '%s'",
           output_fname, shard_id, num_shards, task.name)
@@ -514,17 +541,17 @@ def infer(
                                            chunk_ckpt_path: Optional[str]):
       write_tick = time.time()
       logging.info('Writing chunk %d results to %s', chunk, chunk_path)
-      write_fn(chunk_path, inferences, task_ds, mode,
-               task.output_features['targets'].vocabulary)
+      vocabulary = task.output_features[output_vocab_feature_name].vocabulary
+      write_fn(chunk_path, inferences, task_ds, mode, vocabulary)
       with gfile.GFile(chunk_path + '.COMPLETED', 'w') as f:
-        f.write()
+        f.write('')
       write_time = time.time() - write_tick
+      num_examples = len(inferences[0])
       logging.info('Writing completed in %02f seconds (%02f examples/sec).',
-                   write_time,
-                   len(inferences) / write_time)
+                   write_time, num_examples / write_time)
       update_measurement_series('writing_total_sec', chunk, write_time)
       update_measurement_series('writing_examples_per_sec', chunk,
-                                len(inferences) / write_time)
+                                num_examples / write_time)
 
       if chunk_ckpt_path:
         # Canonicalize checkpoint.
@@ -557,17 +584,18 @@ def infer(
         continue
 
       logging.info('Running inference on %d batches.', checkpoint_period)
-      inferences = _extract_tokens_and_aux_values(
-          infer_fn(model_ds.enumerate(), rng=chunk_rng))
+      infer_result = infer_fn(model_ds.enumerate(), rng=chunk_rng)
+      inferences: Tuple[Sequence[Any], Mapping[str, Any]] = (
+          _extract_tokens_and_aux_values(infer_result))
+      num_examples = len(inferences[0])
 
       if jax.process_index() == 0:
         chunk_time = time.time() - chunk_tick
         logging.info('chunk completed in %02f seconds (%02f examples/sec).',
-                     chunk_time,
-                     len(inferences) / chunk_time)
+                     chunk_time, num_examples / chunk_time)
         update_measurement_series('inference_total_sec', chunk, chunk_time)
         update_measurement_series('inference_examples_per_sec', chunk,
-                                  len(inferences) / chunk_time)
+                                  num_examples / chunk_time)
 
         chunk_ckpt_path = None
         if checkpoint_ds_iter:
@@ -592,8 +620,7 @@ def infer(
             chunk_ckpt_path=chunk_ckpt_path)
 
       # Wait for checkpoint to be written before continuing.
-      multihost_utils.sync_global_devices(
-          f'{task.name}:checkpoint_chunk{chunk:05}')
+      utils.sync_global_devices(f'{task.name}:checkpoint_chunk{chunk:05}')
 
     logging.info("Finished inference for task '%s'.", task.name)
 
@@ -606,8 +633,13 @@ def infer(
       logging.info('Deleting temporary files.')
       gfile.rmtree(tmp_dir)
 
+    if jax.process_index() == 0:
+      with gfile.GFile(
+          os.path.join(output_dir, f'{output_fname}.COMPLETED'), 'w') as f:
+        f.write('')
+
     # Wait for host 0 to finish writing before exiting.
-    multihost_utils.sync_global_devices(f'{task.name}:complete')
+    utils.sync_global_devices(f'{task.name}:complete')
 
   for task in seqio.get_subtasks(task_or_mixture):
     logging.info("Starting inference for task '%s'", task.name)
@@ -625,7 +657,6 @@ if __name__ == '__main__':
   from absl import app
   from absl import flags
   import gin
-  from t5x import gin_utils
   # pylint:enable=g-import-not-at-top
 
   FLAGS = flags.FLAGS

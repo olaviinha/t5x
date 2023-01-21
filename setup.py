@@ -27,7 +27,7 @@ from version import __version__  # pylint: disable=g-import-not-at-top
 with open('README.md') as fp:
   _LONG_DESCRIPTION = fp.read()
 
-_jax_version = '0.2.27'
+_jax_version = '0.4.0'
 _jaxlib_version = '0.1.76'
 
 setuptools.setup(
@@ -48,27 +48,40 @@ setuptools.setup(
     install_requires=[
         'absl-py',
         'cached_property',
-        # TODO(adarob): Replace with 'clu' once >0.0.6 is released.
         'clu @ git+https://github.com/google/CommonLoopUtils#egg=clu',
         'flax @ git+https://github.com/google/flax#egg=flax',
         'gin-config',
         f'jax >= {_jax_version}',
         f'jaxlib >= {_jaxlib_version}',
+        'jestimator',
         'numpy',
-        'seqio-nightly',
+        'orbax @ git+https://github.com/google/orbax#egg=orbax',
+        'seqio @ git+https://github.com/google/seqio#egg=seqio',
         't5',
-        'tensorflow',
+        'tensorflow-cpu',
         'tensorstore >= 0.1.20',
     ],
     extras_require={
         'gcp': [
-            'gevent', 'google-api-python-client', 'google-compute-engine',
-            'google-cloud-storage', 'oauth2client'
+            'gevent',
+            'google-api-python-client',
+            'google-compute-engine',
+            'google-cloud-storage',
+            'oauth2client',
         ],
         'test': ['pytest'],
-
         # Cloud TPU requirements.
         'tpu': [f'jax[tpu] >= {_jax_version}'],
+        'gpu': [
+            'ipdb==0.13.9',
+            'fasttext==0.9.2',
+            'pysimdjson==5.0.2',
+            'pytablewriter==0.64.2',
+            'gdown==4.5.3',
+            'best-download==0.0.9',
+            'lm_dataformat==0.0.20',
+            'tfds-nightly==4.6.0.dev202210040045',
+        ],
     },
     classifiers=[
         'Development Status :: 4 - Beta',

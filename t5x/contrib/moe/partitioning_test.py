@@ -17,179 +17,283 @@
 from typing import Any
 
 from absl.testing import absltest
+import flax
 from flax import core as flax_core
-from flax import optim
 from flax.linen import partitioning as flax_partitioning
 import jax
+from jax._src.lib import xla_bridge
 import numpy as np
+import optax
+from t5x import adafactor
+from t5x import optimizers
+from t5x import partitioning as base_partitioning
+from t5x import test_utils
 from t5x import train_state as train_state_lib
-
 from t5x.contrib.moe import partitioning as moe_partitioning
 from t5x.contrib.moe import training_utils
+
+mock = absltest.mock
 
 AxisMetadata = flax_partitioning.AxisMetadata
 DataLayout = moe_partitioning.DataLayout
 FlaxOptimTrainState = train_state_lib.FlaxOptimTrainState
+FrozenDict = flax_core.frozen_dict.FrozenDict
+FrozenVariableDict = flax_core.scope.FrozenVariableDict
 InferenceState = train_state_lib.InferenceState
 PartitionSpec = moe_partitioning.PartitionSpec
 PRNGKey = Any
 
 
-class LogicalAdam(optim.Adam):
-  """Subclass of Adam optimizer with T5X logical axis partitioning support."""
+def create_model_variables() -> FrozenVariableDict:
+  """Creates simple model variables."""
+  return flax_core.freeze({
+      'params': {
+          'logits_dense': np.ones((16, 16), np.float32),
+          'mlp': {
+              'wo': {
+                  'kernel': np.ones((32, 16), np.float32)
+              }
+          }
+      },
+      'params_axes': {
+          'logits_dense_axes': AxisMetadata(names=('vocab', 'embed')),
+          'mlp': {
+              'wo': {
+                  'kernel_axes': AxisMetadata(names=('embed', 'mlp'))
+              }
+          }
+      }
+  })
 
-  def derive_logical_axes(self, optimizer_state, param_logical_axes):
-    """Derives optimizer logical partitioning from model logical partitions."""
-    del param_logical_axes  # Return fixed axes for test
-    optimizer_logical_axes = {
-        'state': {
-            'param_states': {
-                'logits_dense': {
-                    'grad_ema': None,
-                    'grad_sq_ema': None
-                },
-                'mlp': {
-                    'wo': {
-                        'kernel': {
-                            'grad_ema': PartitionSpec('embed', 'mlp'),
-                            'grad_sq_ema': None
-                        }
-                    }
-                }
-            },
-            'step': None
-        },
-        'target': {
+
+def create_train_state() -> FlaxOptimTrainState:
+  """Creates simple Adam optimizer train state."""
+  optimizer_def = optimizers.adamw(learning_rate=1e-4)
+  return FlaxOptimTrainState.create(optimizer_def, create_model_variables())
+
+
+def create_adafactor_train_state(factored: bool = True) -> FlaxOptimTrainState:
+  """Creates MultiOptimizer train state."""
+  optimizer_def = adafactor.Adafactor(learning_rate=0.1, factored=factored)
+  return FlaxOptimTrainState.create(optimizer_def, create_model_variables())
+
+
+def create_multioptimizer_train_state(
+    factored: bool = True) -> FlaxOptimTrainState:
+  """Creates MultiOptimizer train state."""
+
+  def _is_mlp(path):
+    return 'mlp' in path
+
+  mlp_vars = flax.traverse_util.ModelParamTraversal(
+      lambda path, _: not _is_mlp(path))
+  non_mlp_vars = flax.traverse_util.ModelParamTraversal(
+      lambda path, _: _is_mlp(path))
+  scaled_opt = adafactor.Adafactor(learning_rate=0.1, factored=factored)
+  unscaled_opt = adafactor.Adafactor(
+      learning_rate=0.1, multiply_by_parameter_scale=False, factored=factored)
+
+  optimizer_def = optimizers.MultiOptimizer(
+      ((mlp_vars, scaled_opt), (non_mlp_vars, unscaled_opt)))
+
+  return FlaxOptimTrainState.create(optimizer_def, create_model_variables())
+
+
+class PartitioningTest(absltest.TestCase):
+
+  @mock.patch('jax.local_devices')
+  @mock.patch('jax.devices')
+  @mock.patch.object(xla_bridge, 'process_index')
+  def test_default_mesh(self, process_index_fn, devices_fn, local_devices_fn):
+    # Mesh with 8 devices.
+    devices = test_utils.make_devices(2, 2, 1, 2, kind='TPU v3')
+    devices_fn.return_value = devices
+    local_devices_fn.return_value = [d for d in devices if d.process_index == 0]
+    process_index_fn.return_value = 0
+
+    with self.subTest(name='more_experts_than_devices'):
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=16, num_partitions=1)
+      self.assertEqual(mesh.devices.shape, (1, 8, 1))
+      self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+    with self.subTest(name='equal_experts_and_devices'):
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=8, num_partitions=1)
+      self.assertEqual(mesh.devices.shape, (1, 8, 1))
+      self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+    with self.subTest(name='fewer_experts_than_devices'):
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=4, num_partitions=1)
+      self.assertEqual(mesh.devices.shape, (2, 4, 1))
+      self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+    with self.subTest(name='nontrivial_model_partitions'):
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=8, num_partitions=4)
+      self.assertEqual(mesh.devices.shape, (1, 2, 4))
+      self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+    with self.subTest(name='specified_model_parallel_submesh'):
+      mesh = moe_partitioning.default_moe_mesh(
+          num_expert_partitions=8, model_parallel_submesh=(1, 1, 1, 2))
+      self.assertEqual(mesh.devices.shape, (1, 4, 2))
+      self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+  def test_gpu_mesh(self):
+    mesh = moe_partitioning.get_gpu_mesh()
+    self.assertEqual(mesh.devices.shape, (1, jax.device_count(), 1))
+    self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+  def test_cpu_mesh(self):
+    mesh = moe_partitioning.get_cpu_mesh()
+    self.assertEqual(mesh.devices.shape, (1, jax.device_count(), 1))
+    self.assertEqual(mesh.axis_names, ('data', 'expert', 'model'))
+
+  @mock.patch('jax.local_devices')
+  @mock.patch('jax.devices')
+  @mock.patch.object(xla_bridge, 'process_index')
+  def test_local_chunker_moe_usage(self, process_index_fn, devices_fn,
+                                   local_devices_fn):
+    # The MoE partitioning library uses a 2D "data" mesh spanning ('expert',
+    # 'data') axes, so we reshape the batch across this 2D "data" mesh when
+    # computing replica ids from local chunk info. In this test, we check that
+    # the replica ids constructed in this manner are equivalent to the default
+    # replica id (over a single 'data' mesh axis).
+
+    # Mesh with 32 devices.
+    devices = test_utils.make_devices(2, 2, 1, 2, kind='TPU v3')
+    devices_fn.return_value = devices
+    local_devices_fn.return_value = [d for d in devices if d.process_index == 0]
+    process_index_fn.return_value = 0
+
+    num_expert_partitions = 8
+    moe_mesh = moe_partitioning.default_moe_mesh(
+        num_expert_partitions=num_expert_partitions, num_partitions=2)
+    moe_chunker = base_partitioning.LocalChunker(moe_mesh)
+
+    base_mesh = base_partitioning.default_mesh(num_partitions=2)
+    base_chunker = base_partitioning.LocalChunker(base_mesh)
+
+    for batch_size in [8, 16, 32, 64]:
+      moe_global_array_shape = (batch_size // num_expert_partitions,
+                                num_expert_partitions)
+      moe_replica_id = moe_chunker.get_local_chunk_info(
+          moe_global_array_shape, ('expert', 'data')).replica_id
+      base_global_array_shape = (batch_size,)
+      base_replica_id = base_chunker.get_local_chunk_info(
+          base_global_array_shape, ('data',)).replica_id
+      self.assertEqual(moe_replica_id, base_replica_id)
+
+  @mock.patch('jax.local_devices')
+  @mock.patch('jax.devices')
+  @mock.patch.object(xla_bridge, 'process_index')
+  def test_local_chunker_data_layout(self, process_index_fn, devices_fn,
+                                     local_devices_fn):
+    # Mesh with 32 devices.
+    devices = test_utils.make_devices(4, 4, 1, 2, kind='TPU v3')
+    devices_fn.return_value = devices
+    local_devices_fn.return_value = [d for d in devices if d.process_index == 0]
+
+    for process_index, shard_id in zip([0, 1, 2, 3], [0, 2, 1, 3]):
+      process_index_fn.return_value = process_index
+      partitioner = moe_partitioning.MoePjitPartitioner(
+          num_expert_partitions=8, num_partitions=1)
+      self.assertEqual(
+          partitioner.get_data_layout(batch_size=32),
+          DataLayout(
+              batch_size=32,
+              shard_id=shard_id,
+              num_shards=4,
+              is_first_host_in_replica_set=True))
+
+  def test_logical_axes_for_moe_partitioner_no_overrides(self):
+    partitioner = moe_partitioning.MoePjitPartitioner(
+        num_expert_partitions=8,
+        num_partitions=1,
+        state_filter_fn=training_utils.match_fn(r'no_state_matching'))
+
+    train_state = create_train_state()
+    logical_axes = partitioner.get_logical_axes(train_state)
+
+    # No updates to state.
+    self.assertEqual(logical_axes.param_states, (optax.ScaleByAdamState(
+        count=None,
+        mu=FrozenDict({
             'logits_dense': PartitionSpec('vocab', 'embed'),
             'mlp': {
                 'wo': {
                     'kernel': PartitionSpec('embed', 'mlp'),
                 },
             },
-        }
-    }
-    return optimizer_state.restore_state(optimizer_logical_axes)
-
-
-def create_optimizer():
-  """Creates simple Adam optimizer."""
-  target = {
-      'logits_dense': np.ones((16, 16), np.float32),
-      'mlp': {
-          'wo': {
-              'kernel': np.ones((32, 16), np.float32)
-          }
-      }
-  }
-  return LogicalAdam(learning_rate=1e-4).create(target)
-
-
-class PartitioningTest(absltest.TestCase):
-
-  def test_default_data_layout(self):
-    # No expert replication required. Use default data layout.
-    partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8, num_partitions=1)
-    self.assertFalse(partitioner.two_data_axes)
-    self.assertEqual(
-        partitioner.get_data_layout(batch_size=32),
-        DataLayout(
-            batch_size=32,
-            shard_id=0,
-            num_shards=1,
-            is_first_host_in_replica_set=True))
-
-  def test_two_data_axis_layout_override(self):
-    partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8, num_partitions=1)
-    # Force override case to check layout is valid.
-    partitioner.two_data_axes = True
-    partitioner._data_axis = ('data', 'model')
-    self.assertEqual(
-        partitioner.get_data_layout(batch_size=8),
-        DataLayout(
-            batch_size=8,
-            shard_id=0,
-            num_shards=1,
-            is_first_host_in_replica_set=True))
-
-  def test_logical_axes_for_moe_partitioner(self):
-    partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8, num_partitions=1)
-
-    optimizer = create_optimizer()
-    train_state = FlaxOptimTrainState(
-        optimizer,
-        params_axes={
-            'logits_dense_axes': AxisMetadata(names=('vocab', 'embed')),
-            'mlp': {
-                'wo': {
-                    'kernel_axes': AxisMetadata(names=('embed', 'mlp'))
-                }
-            }
-        })
-
-    logical_axes = partitioner.get_logical_axes(train_state)
-
-    # No updates to state. Should match what derive_logical_axes() returns.
-    jax.tree_map(self.assertIsNone, logical_axes.param_states['logits_dense'])
-    self.assertEqual(logical_axes.param_states['mlp']['wo']['kernel'].grad_ema,
-                     PartitionSpec('embed', 'mlp'))
-    self.assertIsNone(
-        logical_axes.param_states['mlp']['wo']['kernel'].grad_sq_ema)
-
-    self.assertEqual(
-        logical_axes.params, {
+        }),
+        nu=FrozenDict({
             'logits_dense': PartitionSpec('vocab', 'embed'),
             'mlp': {
                 'wo': {
-                    'kernel': PartitionSpec('embed', 'mlp')
-                }
-            }
-        })
+                    'kernel': PartitionSpec('embed', 'mlp'),
+                },
+            },
+        })), optax.EmptyState(), optax.EmptyState()))
+
+    # Target (params) should be unchanged.
+    self.assertEqual(
+        logical_axes.params,
+        FrozenDict({
+            'logits_dense': PartitionSpec('vocab', 'embed'),
+            'mlp': {
+                'wo': {
+                    'kernel': PartitionSpec('embed', 'mlp'),
+                },
+            },
+        }))
 
   def test_logical_axes_for_moe_partitioner_with_overrides(self):
     partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8,
+        num_expert_partitions=8,
         num_partitions=1,
         state_filter_fn=training_utils.match_fn(r'.*mlp.*'))
 
-    optimizer = create_optimizer()
-    train_state = FlaxOptimTrainState(
-        optimizer,
-        params_axes={
-            'logits_dense_axes': AxisMetadata(names=('vocab', 'embed')),
-            'mlp': {
-                'wo': {
-                    'kernel_axes': AxisMetadata(names=('embed', 'mlp'))
-                }
-            }
-        })
-
+    train_state = create_train_state()
     logical_axes = partitioner.get_logical_axes(train_state)
 
-    jax.tree_map(self.assertIsNone, logical_axes.param_states['logits_dense'])
     # 'mlp' params should be prepended with 'expert' spec because
     # state_filter_fn matches '.*mlp.*'.
-    self.assertEqual(logical_axes.param_states['mlp']['wo']['kernel'].grad_ema,
-                     PartitionSpec('expert', 'embed', 'mlp'))
-    self.assertEqual(
-        logical_axes.param_states['mlp']['wo']['kernel'].grad_sq_ema,
-        PartitionSpec('expert',))
-
-    self.assertEqual(
-        logical_axes.params, {
+    self.assertEqual(logical_axes.param_states, (optax.ScaleByAdamState(
+        count=None,
+        mu=FrozenDict({
             'logits_dense': PartitionSpec('vocab', 'embed'),
             'mlp': {
                 'wo': {
-                    'kernel': PartitionSpec('embed', 'mlp')
-                }
-            }
-        })
+                    'kernel': PartitionSpec('expert', 'embed', 'mlp'),
+                },
+            },
+        }),
+        nu=FrozenDict({
+            'logits_dense': PartitionSpec('vocab', 'embed'),
+            'mlp': {
+                'wo': {
+                    'kernel': PartitionSpec('expert', 'embed', 'mlp'),
+                },
+            },
+        })), optax.EmptyState(), optax.EmptyState()))
+
+    # Target (params) should be unchanged.
+    self.assertEqual(
+        logical_axes.params,
+        FrozenDict({
+            'logits_dense': PartitionSpec('vocab', 'embed'),
+            'mlp': {
+                'wo': {
+                    'kernel': PartitionSpec('embed', 'mlp'),
+                },
+            },
+        }))
 
   def test_inference_state_logical_axes(self):
     partitioner = moe_partitioning.MoePjitPartitioner(
-        num_experts=8, num_partitions=1)
+        num_expert_partitions=8, num_partitions=1)
 
     model_variables = flax_core.freeze({
         'params': {
@@ -221,51 +325,62 @@ class PartitioningTest(absltest.TestCase):
                 },
             })))
 
-  def test_overridden_logical_axis_rules(self):
-    # Fewer experts than devices --> modified axis rules with two 'batch' axes.
-    self.assertEqual(
-        moe_partitioning.standard_logical_axis_rules(
-            num_experts=0,
-            num_partitions=1,
-            model_parallel_submesh=None,
-            additional_rules=[('additional', 'model'),
-                              ('expert_magic', 'data')]),
-        [
-            ('batch', ('data', 'model')),  # Shard batch over entire mesh
-            # No sharding of weights over model axis.
-            ('vocab', None),
-            ('embed', None),
-            ('mlp', None),
-            ('heads', None),
-            ('kv', None),
-            ('joined_kv', None),
-            ('relpos_buckets', None),
-            ('abspos_buckets', None),
-            ('length', None),
-            ('layers', None),
-            ('stack', None),
-            ('mlp_activations', None),
-            ('expert', 'data'),  # Shard experts over "first" data axis only
-            ('expert_mlp', None),
-            ('expert_group', None),
-            # Experts replicated along "second" data axis
-            ('expert_replicas', 'model'),
-            ('unmodeled', None),
-            ('additional', None),
-            ('expert_magic', 'data'),
-        ])
+  def test_infer_state_function(self):
 
-  def test_default_logical_axis(self):
-    # Model parallelism used --> default logical axis rules.
+    with self.subTest(name='optax'):
+      optax_train_state = create_train_state()
+      self.assertIsNone(
+          moe_partitioning._infer_state_filter_fn(optax_train_state))
+
+    with self.subTest(name='factored_adafactor'):
+      adafactor_train_state = create_adafactor_train_state(factored=True)
+      match_fn = moe_partitioning._infer_state_filter_fn(adafactor_train_state)
+      self.assertTrue(match_fn('expert/kernel/v_col'))
+      self.assertTrue(match_fn('expert/kernel/v_row'))
+      self.assertFalse(match_fn('expert/kernel/m'))
+      self.assertFalse(match_fn('kernel/v_col'))
+
+    with self.subTest(name='unfactored_adafactor'):
+      adafactor_train_state = create_adafactor_train_state(factored=False)
+      self.assertIsNone(
+          moe_partitioning._infer_state_filter_fn(adafactor_train_state))
+
+    with self.subTest(name='factored_adafactor_multi_optimizer'):
+      multi_opt_train_state = create_multioptimizer_train_state(factored=True)
+      match_fn = moe_partitioning._infer_state_filter_fn(multi_opt_train_state)
+      self.assertTrue(match_fn('expert/kernel/v_col'))
+      self.assertTrue(match_fn('expert/kernel/v_row'))
+      self.assertFalse(match_fn('expert/kernel/m'))
+      self.assertFalse(match_fn('kernel/v_col'))
+
+    with self.subTest(name='unfactored_adafactor_multi_optimizer'):
+      multi_opt_train_state = create_multioptimizer_train_state(factored=False)
+      self.assertIsNone(
+          moe_partitioning._infer_state_filter_fn(multi_opt_train_state))
+
+    with self.subTest(name='mixed_factoring_adafactor_multi_optimizer'):
+      true_vars = flax.traverse_util.ModelParamTraversal(lambda p, _: True)
+      false_vars = flax.traverse_util.ModelParamTraversal(lambda p, _: False)
+      factored_opt = adafactor.Adafactor(learning_rate=0.1, factored=True)
+      unfactored_opt = adafactor.Adafactor(learning_rate=1., factored=False)
+      optimizer_def = optimizers.MultiOptimizer(
+          ((true_vars, factored_opt), (false_vars, unfactored_opt)))
+      multi_opt_train_state = FlaxOptimTrainState.create(
+          optimizer_def, create_model_variables())
+
+      with self.assertRaisesRegex(
+          ValueError,
+          'all suboptimizers must be either factored or unfactored'):
+        _ = moe_partitioning._infer_state_filter_fn(multi_opt_train_state)
+
+  def test_logical_axis_rules(self):
     self.assertEqual(
         moe_partitioning.standard_logical_axis_rules(
-            num_experts=1,
-            num_partitions=2,
-            model_parallel_submesh=None,
-            additional_rules=[('additional', 'model')]),
+            additional_rules=[('additional', 'model'), ('expert_magic',
+                                                        'data')]),
         [
-            ('batch', 'data'),  # Shard batch over single data axis
-            # Default model annotations used.
+            ('batch', ('expert', 'data')),  # Shard batch over entire mesh
+            # No sharding of weights over model axis.
             ('vocab', 'model'),
             ('embed', None),
             ('mlp', 'model'),
@@ -278,46 +393,82 @@ class PartitioningTest(absltest.TestCase):
             ('layers', None),
             ('stack', None),
             ('mlp_activations', None),
-            ('expert', 'data'),  # Shard experts along data axis
+            ('expert', 'expert'),  # Shard experts along expert axis
             ('expert_mlp', 'model'),
-            ('expert_group', None),
-            ('expert_replicas', None),
+            # Experts replicated along "pure" data axis
+            ('expert_replicas', 'data'),
             ('unmodeled', None),
             ('additional', 'model'),
+            ('expert_magic', 'data'),
         ])
 
   def test_data_partition_spec(self):
-    self.assertEqual(
-        moe_partitioning.data_partition_spec(two_data_axes=False),
-        PartitionSpec('data',))
-    self.assertEqual(
-        moe_partitioning.data_partition_spec(two_data_axes=True),
-        PartitionSpec(('data', 'model'),))
-
-  def test_when_to_override_model_axis(self):
-    # More experts than devices.
-    self.assertFalse(
-        moe_partitioning._override_model_axis(
-            num_experts=8, num_partitions=1, model_parallel_submesh=None))
-
-    # Fewer experts than devices.
-    self.assertTrue(
-        moe_partitioning._override_model_axis(
-            num_experts=0, num_partitions=1, model_parallel_submesh=None))
-
-    # Model parallelism used.
-    self.assertFalse(
-        moe_partitioning._override_model_axis(
-            num_experts=1, num_partitions=2, model_parallel_submesh=None))
+    partitioner = moe_partitioning.MoePjitPartitioner(
+        num_expert_partitions=2, num_partitions=1)
+    self.assertEqual(partitioner.data_partition_spec,
+                     PartitionSpec(('expert', 'data'),))
 
   def test_axis_resource_overrides(self):
-    input_resources = (PartitionSpec('data'), PartitionSpec('model'), None,
-                       PartitionSpec('unrecognized'))
-    overridden_resources = moe_partitioning._override_partition_specs(
-        input_resources)
-    # "data" -> ("data", "model"). "model" -> None.
-    self.assertEqual(overridden_resources, (PartitionSpec(
-        ('data', 'model'),), None, None, PartitionSpec('unrecognized',)))
+
+    with self.subTest(name='sequence_of_resources'):
+      input_resources = (PartitionSpec('data'), PartitionSpec('model'),
+                         PartitionSpec('expert'), None,
+                         PartitionSpec('unrecognized'))
+      # 'data' -> ('expert', 'data').
+      self.assertEqual(
+          moe_partitioning.override_partition_specs(input_resources),
+          (PartitionSpec(('expert', 'data'),), PartitionSpec('model'),
+           PartitionSpec('expert'), None, PartitionSpec('unrecognized',)))
+
+    with self.subTest(name='single_resource'):
+      # 'data' -> ('expert', 'data').
+      self.assertEqual(
+          moe_partitioning.override_partition_specs(PartitionSpec('data',)),
+          PartitionSpec(('expert', 'data'),))
+
+    with self.subTest(name='no_override'):
+      # 'data' -> ('expert', 'data').
+      self.assertEqual(
+          moe_partitioning.override_partition_specs(
+              PartitionSpec(('expert', 'data'))),
+          PartitionSpec(('expert', 'data'),))
+
+    with self.subTest(name='no_resource'):
+      self.assertIsNone(moe_partitioning.override_partition_specs(None))
+
+  def test_compute_num_model_partitions(self):
+
+    with self.subTest(name='no_model_parallel_submesh'):
+      self.assertEqual(
+          moe_partitioning.compute_num_model_partitions(
+              num_model_partitions=2, model_parallel_submesh=None), 2)
+
+    with self.subTest(name='no_model_partitions'):
+      self.assertEqual(
+          moe_partitioning.compute_num_model_partitions(
+              num_model_partitions=None, model_parallel_submesh=(1, 2, 1, 2)),
+          4)
+
+    with self.subTest(name='partitions_and_submesh'):
+      self.assertEqual(
+          moe_partitioning.compute_num_model_partitions(
+              num_model_partitions=4, model_parallel_submesh=(1, 2, 1, 2)), 4)
+
+    with self.subTest(name='inconsistent_partitions'):
+      with self.assertRaisesRegex(
+          ValueError,
+          'num_model_partitions and model_parallel_submesh are inconsistent.'):
+        _ = moe_partitioning.compute_num_model_partitions(
+            num_model_partitions=1, model_parallel_submesh=(1, 2, 1, 2))
+
+    with self.subTest(name='no_submesh_or_partitions'):
+      with self.assertRaisesRegex(
+          ValueError,
+          'At least one of num_model_partitions and model_parallel_submesh must '
+          'be specified.'):
+        _ = moe_partitioning.compute_num_model_partitions(
+            num_model_partitions=None, model_parallel_submesh=None)
+
 
 if __name__ == '__main__':
   absltest.main()

@@ -50,13 +50,13 @@ def _assert_numpy_allclose(a, b, atol=None, rtol=None):
 
 
 def check_eq(xs, ys, atol=None, rtol=None):
-  xs_leaves, xs_tree = jax.tree_flatten(xs)
-  ys_leaves, ys_tree = jax.tree_flatten(ys)
+  xs_leaves, xs_tree = jax.tree_util.tree_flatten(xs)
+  ys_leaves, ys_tree = jax.tree_util.tree_flatten(ys)
   assert xs_tree == ys_tree, f"Tree shapes don't match. \n{xs_tree}\n{ys_tree}"
   assert jax.tree_util.tree_all(
-      jax.tree_multimap(lambda x, y: np.array(x).shape == np.array(y).shape,
-                        xs_leaves, ys_leaves)), "Leaves' shapes don't match."
-  assert jax.tree_multimap(
+      jax.tree_map(lambda x, y: np.array(x).shape == np.array(y).shape,
+                   xs_leaves, ys_leaves)), "Leaves' shapes don't match."
+  assert jax.tree_map(
       functools.partial(_assert_numpy_allclose, atol=atol, rtol=rtol),
       xs_leaves, ys_leaves)
 
@@ -71,7 +71,7 @@ def tree_shape(x):
 
 
 def tree_equals(x, y):
-  return jax.tree_util.tree_all(jax.tree_multimap(operator.eq, x, y))
+  return jax.tree_util.tree_all(jax.tree_map(operator.eq, x, y))
 
 
 def get_fake_tokenized_dataset_no_pretokenized(*_, split='validation', **__):
@@ -222,8 +222,11 @@ class BasicTest(chex.TestCase):
                         'mu': self.get_params_shapes(),
                         'nu': self.get_params_shapes(),
                     },
-                    '1': {},
-                    '2': {},
+                    # NB: We eliminate empty tuple leaves from EmptyState() in
+                    # OptaxWrapper to avoid having the rest of T5X have to
+                    # correctly handle this detail. e.g. we omit these:
+                    # '1': {},
+                    # '2': {},
                 },
             }
         }))
@@ -257,7 +260,8 @@ class OptaxWrapperTest(chex.TestCase):
 
     partitioner = partitioning.PjitPartitioner(
         num_partitions=2,
-        logical_axis_rules=partitioning.standard_logical_axis_rules())
+        logical_axis_rules=partitioning.standard_logical_axis_rules(),
+        use_cpu_pjit=True)
 
     train_state_initializer = utils.TrainStateInitializer(
         optimizer_def=model.optimizer_def,
@@ -280,16 +284,22 @@ class OptaxWrapperTest(chex.TestCase):
         learning_rate_fn=learning_rate_fn,
         num_microbatches=1)
 
-    chex.assert_tree_all_finite(train_state.params)
+    chex.assert_tree_all_finite(trainer_instance.train_state.params)
     for _ in range(2):
       trainer_instance.train(ds_iter, 1)
-      chex.assert_tree_all_finite(train_state.params)
+      chex.assert_tree_all_finite(trainer_instance.train_state.params)
+
+    # check save/restore structural equality
+    restored_instance = trainer_instance.train_state.restore_state(
+        trainer_instance.train_state.state_dict())
+    chex.assert_tree_all_equal_structs(trainer_instance.train_state,
+                                       restored_instance)
 
   # NOTE(levskaya): these are surprisingly slow tests on CPU.
   @parameterized.parameters(
       ('sgd', lambda: optax.sgd(1e-2, 0.0)),
       ('adam', lambda: optax.adam(1e-1)),
-      # ('adamw', lambda: optax.adamw(1e-1)),
+      ('adamw', lambda: optax.adamw(1e-1)),
       ('lamb', lambda: optax.adamw(1e-1)),
       # ('rmsprop', lambda: optax.rmsprop(1e-1)),
       # ('rmsprop_momentum', lambda: optax.rmsprop(5e-2, momentum=0.9)),

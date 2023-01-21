@@ -34,7 +34,7 @@ model checkpoints and Gin config files) are available in the
 
 For the example run, you will use the T5 1.1 Small model. The Gin file for this
 model is located at
-[`/t5x/examples/t5/t5_1_1/small.gin`](https://github.com/google-research/t5x/tree/main/t5x/examples/t5/t5_1_1/small.gin),
+[`/t5x/examples/t5/t5_1_1/small.gin`](https://github.com/google-research/t5x/blob/main/t5x/examples/t5/t5_1_1/small.gin),
 and the checkpoint is located at
 [`gs://t5-data/pretrained_models/t5x/t5_1_1_small`](https://console.cloud.google.com/storage/browser/t5-data/pretrained_models/t5x/t5_1_1_small).
 
@@ -89,7 +89,7 @@ reading the [T5X Gin Primer](gin.md) is recommended.
 
 T5X provides a Gin file that configures the T5X trainer for fine-tuning (located
 at
-[`p5x/configs/runs/finetune.gin`](https://github.com/google-research/t5x/tree/main/t5x/configs/runs/finetune.gin)),
+[`t5x/configs/runs/finetune.gin`](https://github.com/google-research/t5x/blob/main/t5x/configs/runs/finetune.gin)),
 and expects a few params from you. These params can be specified in a separate
 Gin file, or via commandline flags. Following are the required params:
 
@@ -99,8 +99,8 @@ Gin file, or via commandline flags. Following are the required params:
 +   `TRAIN_STEPS`: Number of fine-tuning steps. This includes the number of
     steps that the model was pre-trained for, so make sure to add the step
     number from the `INITIAL_CHECKPOINT_PATH`. For the example run, to fine-tune
-    for `20_000` steps, set this to `1_020_000`, since the initial checkpoint
-    is the `1_000_000`th step.
+    for `20_000` steps, set this to `1_020_000`, since the initial checkpoint is
+    the `1_000_000`th step.
 +   `MIXTURE_OR_TASK_NAME`: This is the SeqIO Task or Mixture name to run (from
     Step 2). For the example run, set this to `'wmt_t2t_ende_v003'`.
 +   `TASK_FEATURE_LENGTHS`: This is a dict mapping feature key to maximum int
@@ -116,13 +116,11 @@ Gin file, or via commandline flags. Following are the required params:
     using Mesh Tensorflow (e.g. the public T5 / mT5 / ByT5 models), this should
     be set to `pretraining batch_size` * `pretrained target_token_length`. For
     T5 and T5.1.1: `2048 * 114`. For mT5: `1024 * 229`. For ByT5: `1024 * 189`.
-    For MUM Base/Large/XL: `1024 * 256`. For MUM XXL: `1024 * 229`. For MUM Ace:
-    `4096 * 229`.
 
 In addition to the above params, you will need to include
-[`finetune.gin`](https://github.com/google-research/t5x/tree/main/t5x/configs/runs/finetune.gin)
+[`finetune.gin`](https://github.com/google-research/t5x/blob/main/t5x/configs/runs/finetune.gin)
 and the Gin file for the pre-trained model, which for the example run is
-[`t5_1_1/small.gin`](https://github.com/google-research/t5x/tree/main/t5x/examples/t5/t5_1_1/small.gin).
+[`t5_1_1/small.gin`](https://github.com/google-research/t5x/blob/main/t5x/examples/t5/t5_1_1/small.gin).
 
 ```gin
 include 't5x/configs/runs/finetune.gin'
@@ -152,7 +150,7 @@ LOSS_NORMALIZING_FACTOR = 233472
 ```
 
 See
-[`t5x/examples/t5/t5_1_1/examples/small_wmt_finetune.gin`](https://github.com/google-research/t5x/tree/main/t5x/examples/t5/t5_1_1/examples/small_wmt_finetune.gin)
+[`t5x/examples/t5/t5_1_1/examples/small_wmt_finetune.gin`](https://github.com/google-research/t5x/blob/main/t5x/examples/t5/t5_1_1/examples/small_wmt_finetune.gin)
 for this example.
 
 
@@ -223,9 +221,9 @@ In summary, the metric you actually care about most likely lives under the
 Now that you have successfully fine-tuned a pre-trained model on WMT, here are
 some topics you might want to explore next:
 
-+   [Evaluating a fine-tuned model.](eval)
-+   [Running inference on a fine-tuned model.](infer)
-+   [Training a model from scratch.](pretrain)
++   [Evaluating a fine-tuned model.](eval.md)
++   [Running inference on a fine-tuned model.](infer.md)
++   [Training a model from scratch.](pretrain.md)
 
 We also touch upon a few advanced topics related to fine-tuning below that might
 be useful, especially when customizing your fine-tuning job.
@@ -235,10 +233,10 @@ be useful, especially when customizing your fine-tuning job.
 ### `train`, `train_eval` and `infer_eval` {.no-toc}
 
 A
-[`DatasetConfig`](https://github.com/google-research/t5x/tree/main/t5x/utils.py?l=113&rcl=375475889)
+[`DatasetConfig`](https://github.com/google-research/t5x/blob/main/t5x/utils.py?l=113&rcl=375475889)
 object is used to configure loading SeqIO Tasks/Mixtures for training and eval.
 If you take a closer look at
-[`runs/finetune.gin`](https://github.com/google-research/t5x/tree/main/t5x/configs/runs/finetune.gin),
+[`runs/finetune.gin`](https://github.com/google-research/t5x/blob/main/t5x/configs/runs/finetune.gin),
 you will see that there are three `DatasetConfig` objects defined and passed to
 the train function: `train_dataset_cfg`, `train_eval_dataset_cfg`,
 `infer_eval_dataset_cfg`. Here's a brief description of these configs:
@@ -248,9 +246,9 @@ the train function: `train_dataset_cfg`, `train_eval_dataset_cfg`,
 +   `train_eval`: This configures the Task/Mixture that is used to compute
     training metrics on the eval split, e.g. perplexity. These metrics are
     defined in the
-    [`Model`](https://github.com/google-research/t5x/tree/main/t5x/models.py;l=257-267;rcl=394045248)
+    [`Model`](https://github.com/google-research/t5x/blob/main/t5x/models.py;l=257-267;rcl=394045248)
     class and the eval fn is located
-    [here](https://github.com/google-research/t5x/tree/main/t5x/trainer.py;l=257;rcl=398487394).
+    [here](https://github.com/google-research/t5x/blob/main/t5x/trainer.py;l=257;rcl=398487394).
 +   `infer_eval`: This configures the Task/Mixture that is used to compute
     metrics on inferred model outputs (e.g., comparing decoded model outputs and
     targets). These metrics are defined in the SeqIO Task/Mixture and the eval

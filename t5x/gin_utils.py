@@ -14,7 +14,7 @@
 
 """Utilities for using gin configurations with T5X binaries."""
 import os
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 from absl import app
 from absl import logging
@@ -25,10 +25,33 @@ import tensorflow as tf
 
 
 
+@gin.configurable
+def get_gin_config_str(show_provenance: bool = False) -> str:
+  """Utility function retrieving configuration in string form.
+
+  This is only necessary to to provide a configurable name to toggle the
+  show_provenance parameter.
+
+  Args:
+    show_provenance: Flag indicating whether to show (where possible) the
+      provenance of configuration settings.
+
+  Returns:
+    Current gin configuration as string.
+  """
+  # The following ensures that existing configs will not fail on old gin version
+  # that do not have the show_provenance parameter yet and makes this feature
+  # opt-in.
+  if show_provenance:
+    return gin.config_str(show_provenance=True)
+  else:
+    return gin.config_str()
+
+
 def parse_gin_flags(gin_search_paths: Sequence[str],
                     gin_files: Sequence[str],
                     gin_bindings: Sequence[str],
-                    skip_unknown: bool = False,
+                    skip_unknown: Union[bool, Sequence[str]] = False,
                     finalize_config: bool = True):
   """Parses provided gin files override params.
 
@@ -41,7 +64,7 @@ def parse_gin_flags(gin_search_paths: Sequence[str],
       parsed. Will be applied in order with conflicting settings being overriden
       by later oens.
     skip_unknown: whether to ignore unknown bindings or raise an error (default
-      behavior).
+      behavior). Alternatively, a list of configurable names to skip if unknown.
     finalize_config: whether to finalize the config so that it cannot be
       modified (default behavior).
   """
@@ -60,7 +83,9 @@ def parse_gin_flags(gin_search_paths: Sequence[str],
       gin_bindings,
       skip_unknown=skip_unknown,
       finalize_config=finalize_config)
-  logging.info('Gin Configuration:\n%s', gin.config_str())
+  logging.info('Gin Configuration:')
+  for line in get_gin_config_str().splitlines():
+    logging.info('%s', line)
 
 
 def rewrite_gin_args(args: Sequence[str]) -> Sequence[str]:
@@ -89,7 +114,7 @@ def summarize_gin_config(model_dir: str,
                          step: int):
   """Writes gin config to the model dir and TensorBoard summary."""
   if jax.process_index() == 0:
-    config_str = gin.config_str()
+    config_str = get_gin_config_str()
     tf.io.gfile.makedirs(model_dir)
     # Write the config as JSON.
     with tf.io.gfile.GFile(os.path.join(model_dir, 'config.gin'), 'w') as f:
@@ -104,7 +129,7 @@ def run(main):
   """Wrapper for app.run that rewrites gin args before parsing."""
   app.run(
       main,
-      flags_parser=lambda a: app.parse_flags_with_usage(rewrite_gin_args(a)))
+      flags_parser=lambda a: app.parse_flags_with_usage(rewrite_gin_args(a)))  # pytype: disable=wrong-arg-types
 
 
 # ====================== Configurable Utility Functions ======================
@@ -120,3 +145,16 @@ def sum_fn(var1=gin.REQUIRED, var2=gin.REQUIRED):
 def bool_fn(var1=gin.REQUIRED):
   """bool function to use inside gin files."""
   return bool(var1)
+
+
+@gin.configurable
+def string_split_fn(text=gin.REQUIRED,
+                    separator=gin.REQUIRED,
+                    maxsplit=-1,
+                    index=None):
+  """String split function to use inside gin files."""
+  values = text.split(separator, maxsplit)
+  if index is None:
+    return values
+  else:
+    return values[index]

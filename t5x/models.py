@@ -27,6 +27,7 @@ import clu.metrics as clu_metrics
 from flax import core as flax_core
 from flax import linen as nn
 from flax.core import scope as flax_scope
+from flax.linen import partitioning as flax_partitioning
 from flax.training import common_utils
 import jax
 import jax.numpy as jnp
@@ -41,21 +42,20 @@ import typing_extensions
 
 Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
 MetricsMap = metrics_lib.MetricsMap
-PyTreeDef = type(jax.tree_structure(None))
+PyTreeDef = type(jax.tree_util.tree_structure(None))
 
 
 class TokensIdsToLogitsCallable(typing_extensions.Protocol):
   """Token ids to logits mapping call signature."""
 
   def __call__(
-      self, token_ids: jnp.ndarray, cache: Mapping[str, jnp.ndarray]
+      self, decoding_state: decoding.DecodingState
   ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Performs forward pass to convert token ids to logits.
 
     Args:
-      token_ids: [batch_size, 1] int32 tokens for single position used during
-        incremental decoding. Non-0 prefix tokens to be used as a forced prompt.
-      cache: flax attention cache.
+      decoding_state: Current decoding state, including current token ids and
+        cache.
 
     Returns:
       a tuple of logits with a shape [batch_size, vocab_size] and an updated
@@ -287,12 +287,28 @@ class BaseTransformerModel(BaseModel):
         label_smoothing=self._label_smoothing,
         z_loss=self._z_loss,
         loss_normalizing_factor=loss_normalizing_factor)
+
+    # segment ids to compute packing, padding etc.
+    segment_ids = {
+        k[:-len('_segment_ids')]: v
+        for k, v in batch.items()
+        if k.endswith('_segment_ids')
+    }
+    # If these don't exist then we can create only padding mask.
+    if not segment_ids:
+      segment_ids = {
+          k: v != 0
+          for k, v in batch.items()
+          if k in ('encoder_input_tokens', 'decoder_target_tokens')
+      }
+
     metrics = self._compute_metrics(
         logits=logits,
         targets=batch['decoder_target_tokens'],
         mask=weights,
         loss=loss,
-        z_loss=z_loss)
+        z_loss=z_loss,
+        segment_ids=segment_ids)
     return loss, metrics
 
   def _compute_metrics(
@@ -302,9 +318,15 @@ class BaseTransformerModel(BaseModel):
       mask: jnp.ndarray,
       loss: jnp.ndarray,
       z_loss: Optional[jnp.ndarray] = None,
+      segment_ids: Optional[Mapping[str, jnp.ndarray]] = None,
   ) -> MetricsMap:
     return compute_base_metrics(
-        logits=logits, targets=targets, mask=mask, loss=loss, z_loss=z_loss)
+        logits=logits,
+        targets=targets,
+        mask=mask,
+        loss=loss,
+        z_loss=z_loss,
+        segment_ids=segment_ids)
 
 
 class EncoderDecoderModel(BaseTransformerModel):
@@ -418,10 +440,13 @@ class EncoderDecoderModel(BaseTransformerModel):
         mutable=mutable)
 
   def _compute_logits_from_slice(
-      self, flat_ids: jnp.ndarray, flat_cache: Mapping[str, jnp.ndarray],
-      params: PyTreeDef, encoded_inputs: jnp.ndarray, raw_inputs: jnp.ndarray,
+      self, decoding_state: decoding.DecodingState, params: PyTreeDef,
+      encoded_inputs: jnp.ndarray, raw_inputs: jnp.ndarray,
       max_decode_length: int) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Token slice to logits from decoder model."""
+    flat_ids = decoding_state.cur_token
+    flat_cache = decoding_state.cache
+
     # flat_ids: [batch * beam, seq_len=1]
     # cache is expanded inside beam_search to become flat_cache
     # flat_cache: [batch * beam, num_heads, depth_per_head, max_decode_len]
@@ -572,11 +597,13 @@ class EncoderDecoderModel(BaseTransformerModel):
     # decodes: [batch, num_decodes, max_decode_len + 1]
     # scores: [batch, num_decodes]
     scanned = hasattr(self.module, 'scan_layers') and self.module.scan_layers
+
+    if 'eos_id' not in decoder_params:
+      decoder_params['eos_id'] = self.output_vocabulary.eos_id
     decodes, scores = self._decode_fn(
         inputs=decoder_prompt_inputs,
         cache=cache,
         tokens_to_logits=tokens_ids_to_logits,
-        eos_id=self.output_vocabulary.eos_id,
         num_decodes=num_decodes,
         cache_offset=1 if scanned else 0,
         **decoder_params)
@@ -712,13 +739,19 @@ class DecoderOnlyModel(BaseTransformerModel):
       params: PyTreeDef,
       batch: Mapping[str, jnp.ndarray],
       dropout_rng: Optional[jax.random.KeyArray] = None,
-      mutable: flax_scope.CollectionFilter = False) -> jnp.ndarray:
+      mutable: flax_scope.CollectionFilter = False,
+      other_variables: Optional[PyTreeDef] = None) -> jnp.ndarray:
     """Computes logits via a forward pass of `self.module`."""
     rngs = {'dropout': dropout_rng} if dropout_rng is not None else None
     decoder_causal_attention = self._get_decoder_causal_attention(batch)
+    if other_variables is None:
+      other_variables = {}
 
     return self.module.apply(
-        {'params': params},
+        {
+            'params': params,
+            **other_variables
+        },
         batch['decoder_input_tokens'],
         batch['decoder_target_tokens'],
         decoder_segment_ids=batch.get('decoder_segment_ids', None),
@@ -731,12 +764,13 @@ class DecoderOnlyModel(BaseTransformerModel):
 
   def _compute_logits_from_slice(
       self,
-      flat_ids: jnp.ndarray,
-      flat_cache: Mapping[str, jnp.ndarray],
+      decoding_state: decoding.DecodingState,
       params: PyTreeDef,
       max_decode_length: int,
   ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Token slice to logits from decoder model."""
+    flat_ids = decoding_state.cur_token
+    flat_cache = decoding_state.cache
     # flat_ids: [batch, seq_len=1]
     # flat_cache['cached_(keys|values)']:
     #   [batch, num_heads, depth_per_head, max_decode_length]
@@ -802,6 +836,68 @@ class DecoderOnlyModel(BaseTransformerModel):
       return sequence_scores, intermediates
 
     return sequence_scores
+
+  def _compute_kv_cache(
+      self,
+      params: PyTreeDef,
+      inputs: jnp.ndarray,
+      inputs_lengths: jnp.ndarray,
+      decoder_causal_attention: jnp.ndarray,
+  ) -> PyTreeDef:
+    """Compute the key/value cache on the input prefix."""
+    _, initial_variables = self.module.apply({'params': params},
+                                             jnp.ones_like(inputs),
+                                             jnp.ones_like(inputs),
+                                             enable_dropout=False,
+                                             decode=True,
+                                             mutable=['cache'])
+    cache = initial_variables['cache']
+    if 'cache_axes' in initial_variables:
+      cache_axes = initial_variables['cache_axes']
+
+      cache = jax.tree_util.tree_map(
+          flax_partitioning.with_sharding_constraint, cache,
+          flax_partitioning.get_axis_names(cache_axes))
+
+    # Prefill our cache with all the inputs. `inputs_lengths` is the index of
+    # the last input token. The cache will be filled for all the input
+    # positions, save the last input token. The cache index will point to the
+    # index of this last input token which is considered during prefilling but
+    # not cached. This re-computation is required as the logits for this
+    # position are required for selecting the first output token.
+    #
+    # The cache is still `[B, ..., max_decode_len]` but any position less than
+    # the `inputs_length` will be non-zero, that is
+    # `cached_key[b, ..., i < inputs_lengths[b]] != 0`.
+    #
+    # The cache index is now a vector of size [B] = input_lengths
+
+    # If `self._inputs_bidirectional_attention = False`, we should not pass
+    # batch['decoder_causal_attention'] to `module.apply` during cache prefill
+    # and pass None instead.
+    maybe_decoder_causal_attention = self._get_decoder_causal_attention(
+        {'decoder_causal_attention': decoder_causal_attention})
+
+    _, variables_with_cache = self.module.apply(
+        {
+            'params': params,
+            'cache': cache
+        },
+        decoder_input_tokens=inputs,
+        # Use the `decoder_causal_attention`, which has 1 for all input
+        # positions, including the BOS token, as the targets so when the
+        # decoder attention mask is built, it will correctly cover the whole
+        # input, Using something like the inputs will cause the first input
+        # token (the 0 for BOS) will not be included in the mask. This also
+        # restricts the mask to not include any target positions like it would
+        # if you used `decoder_target_tokens`.
+        decoder_target_tokens=decoder_causal_attention,
+        decoder_causal_attention=maybe_decoder_causal_attention,
+        mutable=['cache'],
+        enable_dropout=False,
+        prefill=True,
+        prefill_lengths=inputs_lengths)
+    return variables_with_cache['cache']
 
   def predict_batch_with_aux(
       self,
@@ -901,21 +997,6 @@ class DecoderOnlyModel(BaseTransformerModel):
           'Batch does not have the right format for text generation: probably '
           'because `task_feature_lengths` passed to the feature converter does '
           'not have both `inputs` and `targets`.')
-    # Prepare zeroed-out autoregressive cache. The shape will be
-    # [batch, ..., max_decode_length]
-    target_shape = batch['decoder_input_tokens'].shape
-    target_type = batch['decoder_input_tokens'].dtype
-    max_decode_length = target_shape[1]
-
-    _, variables_with_cache = self.module.apply(
-        {'params': params},
-        jnp.ones(target_shape, target_type),
-        jnp.ones(target_shape, target_type),
-        enable_dropout=False,
-        decode=True,
-        mutable=['cache'])
-    cache = variables_with_cache['cache']
-
     # We can use the decoder causal attention mask to tell how long the inputs
     # are. The causal mask has a 1 for all the input tokens (and one more to
     # cover the original BOS token, created by shifting the inputs one to the
@@ -927,44 +1008,11 @@ class DecoderOnlyModel(BaseTransformerModel):
     # tokens, this masks out targets portion of the decoder_input_tokens.
     inputs = batch['decoder_input_tokens'] * batch['decoder_causal_attention']
 
-    # Prefill our cache with all the inputs. `inputs_lengths` is the index of
-    # the last input token. The cache will be filled for all the input
-    # positions, save the last input token. The cache index will point to the
-    # index of this last input token which is considered during prefilling but
-    # not cached. This re-computation is required as the logits for this
-    # position are required for selecting the first output token.
-    #
-    # The cache is still `[B, ..., max_decode_len]` but any position less than
-    # the `inputs_length` will be non-zero, that is
-    # `cached_key[b, ..., i < inputs_lengths[b]] != 0`.
-    #
-    # The cache index is now a vector of size [B] = input_lengths
+    prefilled_cache = self._compute_kv_cache(params, inputs, inputs_lengths,
+                                             batch['decoder_causal_attention'])
 
-    # If `self._inputs_bidirectional_attention = False`, we should not pass
-    # batch['decoder_causal_attention'] to `module.apply` during cache prefill
-    # and pass None instead.
-    maybe_decoder_causal_attention = self._get_decoder_causal_attention(batch)
-
-    _, variables_with_cache = self.module.apply(
-        {
-            'params': params,
-            'cache': cache
-        },
-        decoder_input_tokens=inputs,
-        # Use the `decoder_causal_attention`, which has 1 for all input
-        # positions, including the BOS token, as the targets so when the
-        # decoder attention mask is built, it will correctly cover the whole
-        # input, Using something like the inputs will cause the first input
-        # token (the 0 for BOS) will not be included in the mask. This also
-        # restricts the mask to not include any target positions like it would
-        # if you used `decoder_target_tokens`.
-        decoder_target_tokens=batch['decoder_causal_attention'],
-        decoder_causal_attention=maybe_decoder_causal_attention,
-        mutable=['cache'],
-        enable_dropout=False,
-        prefill=True,
-        prefill_lengths=inputs_lengths)
-    prefilled_cache = variables_with_cache['cache']
+    target_shape = batch['decoder_input_tokens'].shape
+    max_decode_length = target_shape[1]
 
     tokens_ids_to_logits = functools.partial(
         self._compute_logits_from_slice,
@@ -985,11 +1033,13 @@ class DecoderOnlyModel(BaseTransformerModel):
     # sampling with the prefix.
     # [batch, max_decode_length]
     scanned = hasattr(self.module, 'scan_layers') and self.module.scan_layers
+
+    if 'eos_id' not in decoder_params:
+      decoder_params['eos_id'] = self.output_vocabulary.eos_id
     decoded_sequences, scores = self._decode_fn(
         inputs=inputs,
         cache=prefilled_cache,
         tokens_to_logits=tokens_ids_to_logits,
-        eos_id=self.output_vocabulary.eos_id,
         num_decodes=num_decodes,
         initial_index=inputs_lengths,
         cache_offset=1 if scanned else 0,
@@ -1091,12 +1141,47 @@ def compute_metrics(logits: jnp.ndarray, targets: jnp.ndarray,
   return metrics
 
 
+def count_packed_examples(segment_ids: jnp.ndarray) -> int:
+  """Return the number of packed examples.
+
+  After packing, each row of segment_ids contains the ids of packed examples.
+  For some model inputs, some features could have some examples but not others.
+  For example, two tasks in a multimodal setup could be: (1). text -> text, and
+  (2). image -> text. Examples from (1) will be missing image input feature and
+  examples from (2) will be missing text input feature.
+
+  To count the packed examples, we count the unique ids in segment_ids excluding
+  0s (because of padding). It can be implemented by counting the number of
+  non-zero values in the first discrete difference along axis=1, plus the number
+  of rows in segment_ids, and minus the number of padded examples.
+
+  Example:
+    [[1, 1, 3, 3, 0, 0],
+     [2, 2, 2, 2, 2, 2],
+     [2, 7, 7, 7, 7, 0]] has 5 packed examples.
+
+  Args:
+    segment_ids: [B, L] array.
+
+  Returns:
+    Scalar count.
+  """
+
+  # If there is padding, it's at the end and the id is always 0.
+  num_padded_examples = jnp.sum(segment_ids[:, -1] == 0)
+  # Get the first discrete different along axis=1.
+  first_diff = jnp.diff(segment_ids, n=1, axis=1)
+  # count = #(non-0 diff) + #(row) - #(padded ex).
+  return jnp.sum(first_diff != 0) + segment_ids.shape[0] - num_padded_examples
+
+
 def compute_base_metrics(
     logits: jnp.ndarray,
     targets: jnp.ndarray,
     mask: jnp.ndarray,
     loss: jnp.ndarray,
     z_loss: Optional[jnp.ndarray] = None,
+    segment_ids: Optional[Mapping[str, jnp.ndarray]] = None,
 ) -> MetricsMap:
   """Compute summary metrics.
 
@@ -1107,7 +1192,8 @@ def compute_base_metrics(
      values (float-valued weights not supported).
    loss: loss (float)
    z_loss: z_loss (float)
-
+   segment_ids: Optional dictionary of feature and value is the segment ids used
+     for packing, i.e. [batch, length] arrays.
   Returns:
     Dict of metrics.
   """
@@ -1145,7 +1231,7 @@ def compute_base_metrics(
       'timing/target_tokens_per_second_per_core':
           metrics_lib.TimeRate.from_model_output(numerator=num_tokens /
                                                  num_devices),
-      'nonpadding_fraction':
+      'non_padding_fraction/loss_weights':
           clu_metrics.Average(total=nonpadding_tokens, count=num_tokens),
   }
   if z_loss is not None:
@@ -1159,6 +1245,27 @@ def compute_base_metrics(
         'cross_ent_loss_per_all_target_tokens':
             clu_metrics.Average(total=jnp.sum(loss - z_loss), count=num_tokens)
     })
+
+  if segment_ids is not None:
+    total_tokens = 0
+    total_non_padding_tokens = 0
+    for feature, feature_segment_ids in segment_ids.items():
+      if feature_segment_ids is None or feature_segment_ids.shape[1] == 0:
+        continue
+      # Since this is [B, L] with the segment ids in axis = 1.
+      num_examples = count_packed_examples(feature_segment_ids)
+      metrics[f'effective_batch_size/{feature}'] = metrics_lib.AveragePerStep(
+          total=num_examples)
+      # 0s is padding
+      feature_non_padding = jnp.sum(feature_segment_ids != 0)
+      feature_size = feature_segment_ids.size
+      total_tokens += feature_size
+      total_non_padding_tokens += feature_non_padding
+      metrics[f'non_padding_fraction/{feature}'] = clu_metrics.Average(
+          total=feature_non_padding, count=feature_size)
+    metrics['non_padding_fraction/overall'] = clu_metrics.Average(
+        total=total_non_padding_tokens, count=total_tokens)
+
   return metrics
 
 

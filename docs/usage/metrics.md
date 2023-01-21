@@ -1,9 +1,6 @@
 # Metrics Overview
 
 
-TIP: See [below](#migration-instructions) for concrete instructions on how to
-align your metrics with the redesigned T5X metric library.
-
 ## Introduction
 
 T5X provides a flexible and customizable library for managing metrics. Metrics
@@ -78,7 +75,7 @@ In addition to CLU provided metrics like Average and Accuracy, T5X provides a
 few specialized metrics, like TimeRate and AveragePerStep. A full list of CLU
 metrics is provided at
 [clu/metrics.py](https://github.com/google/CommonLoopUtils/tree/main/clu/metrics.py) while T5X metrics
-are listed in [t5x/metrics.py](https://github.com/google-research/t5x/tree/main/t5x/metrics.py). We
+are listed in [t5x/metrics.py](https://github.com/google-research/t5x/blob/main/t5x/metrics.py). We
 will elaborate on specialized metrics like TimeRate and AveragePerStep
 [below](#special-t5x-metrics).
 
@@ -121,7 +118,7 @@ mapping can be easily obtained by calling `metric.compute_value()`.
 to the console, TF summary files, XManager, and others. See
 [source](https://github.com/google/CommonLoopUtils/tree/main/clu/metric_writers/) for full details. By
 default, the T5X
-[`MetricsManager`](https://github.com/google-research/t5x/tree/main/t5x/trainer.py?q=symbol:%5CbMetricsManager%5Cb)
+[`MetricsManager`](https://github.com/google-research/t5x/blob/main/t5x/trainer.py?q=symbol:%5CbMetricsManager%5Cb)
 logs metrics to
 [TensorBoard](https://github.com/google/CommonLoopUtils/tree/main/clu/metric_writers/summary_writer.py),
 [XManager](https://github.com/google/CommonLoopUtils/tree/main/clu/metric_writers/google/xm_measurement_writer.py),
@@ -150,11 +147,8 @@ The metrics created on one particular training step (one call of the loss
 function) are accumulated over subsequent steps (using the `merge` method).
 
 NOTE: Unlike in previous versions of T5X, "initial metrics" should not be
-defined, since the metrics returned from the first training step are simply used
-as the initial metrics. Specifically, the `get_initial_metrics` functions
-provided by BaseTrainer and BaseModel will be deprecated in the future. Now, the
-first metrics returned from `loss_fn` are treated as the initial metrics for
-later accumulation.
+defined, since the first metrics returned from `loss_fn` are treated as the
+initial metrics for later accumulation.
 
 Finally, in order to summarize the metrics into writable forms, we can simply
 use the following:
@@ -164,8 +158,7 @@ summary = {k: m.compute() for k, m in metrics.items()}
 ```
 
 Typically, the above call will not be necessary, since the T5X `BaseModel`
-already includes it automatically. Any model inheriting from this class can rely
-on its implementation of `summarize_metrics_fn`.
+already includes it automatically.
 
 ### A Metric Example
 
@@ -219,7 +212,7 @@ migration towards new-style metrics in T5X. Please help us clean it up!
 
 A few metrics are somewhat more complicated to use, largely due to limitations
 of the T5X training library. Metrics can be found at
-[`t5x/metrics.py`](https://github.com/google-research/t5x/tree/main/t5x/metrics.py).
+[`t5x/metrics.py`](https://github.com/google-research/t5x/blob/main/t5x/metrics.py).
 
 #### `AveragePerStep`
 
@@ -238,7 +231,7 @@ For example, we need to initialize `z_loss` and `steps_per_second` as follows:
 ```
 
 Then, before summarization
-[`set_step_metrics_num_steps(metrics, num_steps)`](https://github.com/google-research/t5x/tree/main/t5x/metrics.py;l=222)
+[`set_step_metrics_num_steps(metrics, num_steps)`](https://github.com/google-research/t5x/blob/main/t5x/metrics.py;l=222)
 is called automatically to set the number of steps for relevant metrics.
 
 #### `TimeRate`
@@ -255,7 +248,7 @@ For example, we can initialize a `seqs_per_second` metric as follows:
 ```
 
 Before summarization,
-[`set_time_rate_metrics_duration(metrics, duration)`](https://github.com/google-research/t5x/tree/main/t5x/metrics.py;l=209)
+[`set_time_rate_metrics_duration(metrics, duration)`](https://github.com/google-research/t5x/blob/main/t5x/metrics.py;l=209)
 is called automatically called to set the duration of time-related metrics.
 
 #### `StepsPerTime`
@@ -268,32 +261,6 @@ metric such as `steps_per_second`.
 ```
 
 NOTE: Unless you are also overriding
-[Trainer](https://github.com/google-research/t5x/tree/main/t5x/trainer.py;l=314), you likely only
+[Trainer](https://github.com/google-research/t5x/blob/main/t5x/trainer.py;l=314), you likely only
 need to worry about initializing metrics correctly, and not about making later
 adjustments for duration and number of microbatches.
-
-## Migration Instructions
-
-If your T5X models override functions such as `get_initial_metrics` or
-`summarize_metrics_fn`, please align with the current version of the T5X metrics
-library by using the following instructions.
-
-1.  Remove `get_initial_metrics` from models inheriting from T5X
-    [`BaseModel`](https://github.com/google-research/t5x/tree/main/t5x/models.py?q=symbol:%5CbBaseModel%5Cb).
-    Accumulation now happens automatically and initial metrics do not need to be
-    explicitly specified.
-
-2.  Ensure all metrics dicts are mappings of string name to `clu.metrics.Metric`
-    object, rather than mappings of string name to scalar values. See
-    [above](#metrics-and-writers) for more details.
-
-3.  Wherever metrics are computed (typically in a model's `loss_fn`), use a
-    `Metric` subclass that fully describes the behavior of the metric. If the
-    metric is an average, use `clu.metrics.Average`. If it is an accuracy
-    metric, consider using `clu.metrics.Accuracy`. At any point, you must be
-    able to call `metric.compute()` and receive the correct value of the metric.
-    See [examples](#a-metric-example) for more details.
-
-4.  Remove `summarize_metrics_fn` from models once the previous step is
-    complete, as summarization now happens automatically.
-
